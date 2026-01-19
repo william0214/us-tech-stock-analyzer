@@ -17,6 +17,7 @@ import pytz
 # 股票分類
 STOCK_CATEGORIES = {
     'AI產業龍頭': ['NVDA', 'MSFT', 'GOOGL', 'META', 'TSLA', 'AMD', 'AVGO', 'ORCL', 'CRM', 'PLTR'],
+    '記憶體產業': ['MU', 'WDC', 'STX'],
     '區塊鏈相關': ['COIN', 'MSTR', 'RIOT', 'MARA', 'PYPL'],
     '台股連動核心': ['AAPL', 'QCOM', 'INTC', 'AMZN']
 }
@@ -29,7 +30,10 @@ FOREIGN_TARGET_PRICES = {
     '日月光 (3711)': {'target': 340, 'source': '美系外資'},
     '京元電 (2449)': {'target': 330, 'source': '美系外資'},
     '緯創 (3231)': {'target': 215, 'source': '多家法人'},
-    '旺矽 (6223)': {'target': 2800, 'source': '美系外資'}
+    '旺矽 (6223)': {'target': 2800, 'source': '美系外資'},
+    '南亞科 (2408)': {'target': 85, 'source': '美系外資'},
+    '華邦電 (2344)': {'target': 38, 'source': '凱基投顧'},
+    '旺宏 (2337)': {'target': 95, 'source': '外資券商'}
 }
 
 # Gmail 設定
@@ -40,6 +44,143 @@ GMAIL_CONFIG = {
     'smtp_server': 'smtp.gmail.com',
     'smtp_port': 465
 }
+
+def get_earnings_calendar():
+    """獲取近期財報公布資訊"""
+    earnings_data = []
+    all_tickers = []
+    
+    # 收集所有股票代碼
+    for tickers in STOCK_CATEGORIES.values():
+        all_tickers.extend(tickers)
+    
+    print("檢查財報公布資訊...")
+    
+    for ticker in all_tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            calendar = stock.calendar
+            
+            if calendar is not None and not calendar.empty:
+                # 獲取財報日期
+                if 'Earnings Date' in calendar.index:
+                    earnings_date = calendar.loc['Earnings Date']
+                    if isinstance(earnings_date, pd.Series):
+                        earnings_date = earnings_date.iloc[0]
+                    
+                    # 檢查是否在近期（前後 3 天）
+                    today = datetime.now()
+                    if isinstance(earnings_date, (pd.Timestamp, datetime)):
+                        days_diff = (earnings_date - today).days
+                        
+                        if -1 <= days_diff <= 3:
+                            # 獲取 EPS 預估與實際
+                            eps_estimate = None
+                            eps_actual = None
+                            
+                            if 'EPS Estimate' in calendar.index:
+                                eps_estimate = calendar.loc['EPS Estimate']
+                                if isinstance(eps_estimate, pd.Series):
+                                    eps_estimate = eps_estimate.iloc[0]
+                            
+                            # 嘗試獲取實際 EPS
+                            try:
+                                earnings_history = stock.earnings_dates
+                                if earnings_history is not None and not earnings_history.empty:
+                                    latest_earnings = earnings_history.iloc[0]
+                                    if 'Reported EPS' in latest_earnings:
+                                        eps_actual = latest_earnings['Reported EPS']
+                            except:
+                                pass
+                            
+                            earnings_data.append({
+                                'ticker': ticker,
+                                'earnings_date': earnings_date,
+                                'days_diff': days_diff,
+                                'eps_estimate': eps_estimate,
+                                'eps_actual': eps_actual
+                            })
+                            
+                            status = "已公布" if days_diff <= 0 else f"{days_diff}天後"
+                            print(f"  ✓ {ticker}: 財報日 {earnings_date.strftime('%Y-%m-%d')} ({status})")
+        except Exception as e:
+            # 静默失敗，不影響主流程
+            pass
+    
+    return earnings_data
+
+def analyze_earnings_impact(earnings_data, stock_data_df):
+    """分析財報對股價的影響"""
+    earnings_analysis = []
+    
+    for earning in earnings_data:
+        ticker = earning['ticker']
+        
+        # 獲取股票漲跌資訊
+        stock_info = stock_data_df[stock_data_df['ticker'] == ticker]
+        if stock_info.empty:
+            continue
+        
+        change_pct = stock_info['change_pct'].iloc[0]
+        
+        # 判斷是否符合預期
+        beat_or_miss = None
+        impact_analysis = ""
+        
+        if earning['eps_actual'] is not None and earning['eps_estimate'] is not None:
+            try:
+                eps_actual = float(earning['eps_actual'])
+                eps_estimate = float(earning['eps_estimate'])
+                
+                if eps_actual > eps_estimate:
+                    beat_or_miss = 'beat'
+                    beat_pct = ((eps_actual - eps_estimate) / abs(eps_estimate)) * 100 if eps_estimate != 0 else 0
+                    impact_analysis = f"優於預期 {beat_pct:.1f}%"
+                elif eps_actual < eps_estimate:
+                    beat_or_miss = 'miss'
+                    miss_pct = ((eps_estimate - eps_actual) / abs(eps_estimate)) * 100 if eps_estimate != 0 else 0
+                    impact_analysis = f"低於預期 {miss_pct:.1f}%"
+                else:
+                    beat_or_miss = 'inline'
+                    impact_analysis = "符合預期"
+            except:
+                pass
+        
+        # 分析股價反應
+        if earning['days_diff'] <= 0:  # 已公布
+            if beat_or_miss == 'beat':
+                if change_pct > 3:
+                    market_reaction = "市場反應正面，股價大漲"
+                elif change_pct > 0:
+                    market_reaction = "市場反應正面，温和上漲"
+                else:
+                    market_reaction = "儘管優於預期，但股價下跌（可能受大盤影響）"
+            elif beat_or_miss == 'miss':
+                if change_pct < -3:
+                    market_reaction = "市場反應負面，股價大跌"
+                elif change_pct < 0:
+                    market_reaction = "市場反應負面，温和下跌"
+                else:
+                    market_reaction = "儘管低於預期，但股價上漲（可能受大盤帶動）"
+            else:
+                market_reaction = f"股價變動 {change_pct:+.2f}%"
+        else:
+            market_reaction = f"預計 {earning['days_diff']} 天後公布，市場觀望中"
+        
+        earnings_analysis.append({
+            'ticker': ticker,
+            'name': stock_info['name'].iloc[0],
+            'earnings_date': earning['earnings_date'],
+            'days_diff': earning['days_diff'],
+            'eps_estimate': earning['eps_estimate'],
+            'eps_actual': earning['eps_actual'],
+            'beat_or_miss': beat_or_miss,
+            'impact_analysis': impact_analysis,
+            'market_reaction': market_reaction,
+            'change_pct': change_pct
+        })
+    
+    return earnings_analysis
 
 def get_stock_data(ticker):
     """獲取單支股票數據"""
@@ -174,13 +315,43 @@ def generate_taiwan_recommendations(us_stocks_df):
             'has_target': True
         })
     
+    # 記憶體產業
+    memory_stocks = us_stocks_df[us_stocks_df['category'] == '記憶體產業']
+    if not memory_stocks.empty:
+        mu_stocks = memory_stocks[memory_stocks['ticker'] == 'MU']
+        if not mu_stocks.empty:
+            mu_change = mu_stocks['change_pct'].iloc[0]
+            if mu_change > 2:
+                recommendations.append({
+                    'stock': '南亞科 (2408)',
+                    'reason': f'美光大漲 {mu_change:.2f}%，DRAM 產業景氣回溫',
+                    'timing': '突破季線可進場',
+                    'risk': '記憶體價格波動大',
+                    'has_target': True
+                })
+                recommendations.append({
+                    'stock': '華邦電 (2344)',
+                    'reason': 'NOR Flash 需求增加，車用市場成長',
+                    'timing': '回檔至支撐區可布局',
+                    'risk': '毛利率仍在低檔',
+                    'has_target': True
+                })
+            elif mu_change < -2:
+                recommendations.append({
+                    'stock': '旺宏 (2337)',
+                    'reason': f'美光下跌 {abs(mu_change):.2f}%，但 NOR Flash 需求穩定',
+                    'timing': '逆勢佈局，等待產業反轉',
+                    'risk': '短期可能繼續修正',
+                    'has_target': True
+                })
+    
     # 區塊鏈相關
     crypto_stocks = us_stocks_df[us_stocks_df['category'] == '區塊鏈相關']
     if not crypto_stocks.empty:
         crypto_avg_change = crypto_stocks['change_pct'].mean()
         if crypto_avg_change > 3:
             recommendations.append({
-                'stock': '世芯-KY (3661)',
+                'stock': '世芝-KY (3661)',
                 'reason': f'區塊鏈股平均大漲 {crypto_avg_change:.2f}%，挖礦晶片設計受惠',
                 'timing': '開盤跳空可等回測缺口',
                 'risk': '加密貨幣波動影響大',
@@ -189,7 +360,7 @@ def generate_taiwan_recommendations(us_stocks_df):
     
     return recommendations
 
-def generate_html_report(df, stock_data_by_category, taiwan_recs):
+def generate_html_report(df, stock_data_by_category, taiwan_recs, earnings_analysis=[]):
     """生成 HTML 格式報告"""
     
     # 取得台北時間
@@ -290,6 +461,38 @@ def generate_html_report(df, stock_data_by_category, taiwan_recs):
             background-color: #ff6f00;
             color: white;
         }}
+        .badge-earnings {{
+            background-color: #9c27b0;
+            color: white;
+        }}
+        .badge-beat {{
+            background-color: #4caf50;
+            color: white;
+        }}
+        .badge-miss {{
+            background-color: #f44336;
+            color: white;
+        }}
+        .earnings-card {{
+            background: #f3e5f5;
+            border-left: 4px solid #9c27b0;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }}
+        .earnings-card h3 {{
+            margin: 0 0 10px 0;
+            color: #333;
+            font-size: 18px;
+        }}
+        .earnings-card p {{
+            margin: 5px 0;
+            font-size: 14px;
+        }}
+        .earnings-card .label {{
+            font-weight: bold;
+            color: #9c27b0;
+        }}
         .recommendation-card {{
             background: #f8f9fa;
             border-left: 4px solid #667eea;
@@ -331,6 +534,60 @@ def generate_html_report(df, stock_data_by_category, taiwan_recs):
     <div class="header">
         <h1>📊 美股科技股分析報告</h1>
         <div class="time">報告時間：{report_time}</div>
+    </div>
+"""
+    
+    # 財報分析
+    if earnings_analysis:
+        html += """
+    <div class="section">
+        <h2>📊 近期財報公布與分析</h2>
+        <p style="color: #666; margin-bottom: 20px;">
+            以下為近期公布或即將公布財報的股票，包含 EPS 與市場預期比較、股價反應分析。
+        </p>
+"""
+        
+        for earning in earnings_analysis:
+            # 決定徵章
+            if earning['beat_or_miss'] == 'beat':
+                performance_badge = '<span class="badge badge-beat">優於預期</span>'
+            elif earning['beat_or_miss'] == 'miss':
+                performance_badge = '<span class="badge badge-miss">低於預期</span>'
+            elif earning['beat_or_miss'] == 'inline':
+                performance_badge = '<span class="badge badge-earnings">符合預期</span>'
+            else:
+                performance_badge = '<span class="badge badge-earnings">即將公布</span>'
+            
+            # EPS 資訊
+            eps_info = ""
+            if earning['eps_actual'] is not None and earning['eps_estimate'] is not None:
+                eps_info = f"<p><span class='label'>EPS 預估：</span>${earning['eps_estimate']:.2f} | <span class='label'>EPS 實際：</span>${earning['eps_actual']:.2f}</p>"
+            elif earning['eps_estimate'] is not None:
+                eps_info = f"<p><span class='label'>EPS 預估：</span>${earning['eps_estimate']:.2f}</p>"
+            
+            # 財報日期
+            earnings_date_str = earning['earnings_date'].strftime('%Y年%m月%d日')
+            if earning['days_diff'] <= 0:
+                date_info = f"已於 {earnings_date_str} 公布"
+            else:
+                date_info = f"預計 {earnings_date_str} 公布（{earning['days_diff']} 天後）"
+            
+            # 股價變動
+            change_class = 'positive' if earning['change_pct'] > 0 else 'negative'
+            change_sign = '+' if earning['change_pct'] > 0 else ''
+            
+            html += f"""
+        <div class="earnings-card">
+            <h3>{earning['ticker']} - {earning['name']} {performance_badge}</h3>
+            <p><span class="label">財報日期：</span>{date_info}</p>
+            {eps_info}
+            {f"<p><span class='label'>表現評估：</span>{earning['impact_analysis']}</p>" if earning['impact_analysis'] else ""}
+            <p><span class="label">市場反應：</span>{earning['market_reaction']}</p>
+            <p><span class="label">股價變動：</span><span class="{change_class}">{change_sign}{earning['change_pct']:.2f}%</span></p>
+        </div>
+"""
+        
+        html += """
     </div>
 """
     
@@ -528,22 +785,33 @@ def main():
     
     try:
         # 分析股票
-        print("\n【步驟 1/4】分析美股科技股...")
+        print("\n【步驟 1/5】分析美股科技股...")
         df, stock_data_by_category = analyze_stocks()
         print(f"✓ 成功分析 {len(df)} 支股票")
         
+        # 獲取財報資訊
+        print("\n【步驟 2/5】搜尋近期財報公布...")
+        earnings_data = get_earnings_calendar()
+        earnings_analysis = []
+        if earnings_data:
+            print(f"✓ 發現 {len(earnings_data)} 支股票有近期財報")
+            earnings_analysis = analyze_earnings_impact(earnings_data, df)
+            print(f"✓ 完成財報影響分析")
+        else:
+            print("✓ 近期無財報公布")
+        
         # 生成台股推薦
-        print("\n【步驟 2/4】生成台股投資建議...")
+        print("\n【步驟 3/5】生成台股投資建議...")
         taiwan_recs = generate_taiwan_recommendations(df)
         print(f"✓ 生成 {len(taiwan_recs)} 項台股推薦")
         
         # 生成報告
-        print("\n【步驟 3/4】生成 HTML 報告...")
-        html_report = generate_html_report(df, stock_data_by_category, taiwan_recs)
+        print("\n【步驟 4/5】生成 HTML 報告...")
+        html_report = generate_html_report(df, stock_data_by_category, taiwan_recs, earnings_analysis)
         print("✓ HTML 報告生成完成")
         
         # 發送郵件
-        print("\n【步驟 4/4】發送郵件...")
+        print("\n【步驟 5/5】發送郵件...")
         if send_email(html_report):
             print("\n" + "=" * 60)
             print("✓ 任務完成！報告已成功發送")
